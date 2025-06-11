@@ -1,0 +1,35 @@
+(RKNN-Toolkit2) root@RKNN-ToolKit2:~/rknn_model_zoo/examples/yolov8_pose/python# python convert.py ../model/yolov8n-pose.onnx rk3588
+I rknn-toolkit2 version: 2.3.2
+--> Config model
+done
+--> Loading model
+I Loading : 100%|██████████████████████████████████████████████| 144/144 [00:00<00:00, 31429.45it/s]
+done
+--> Building model
+I OpFusing 0: 100%|██████████████████████████████████████████████| 100/100 [00:00<00:00, 892.80it/s]
+I OpFusing 1 : 100%|█████████████████████████████████████████████| 100/100 [00:00<00:00, 487.61it/s]
+I OpFusing 0 : 100%|█████████████████████████████████████████████| 100/100 [00:00<00:00, 426.16it/s]
+I OpFusing 1 : 100%|█████████████████████████████████████████████| 100/100 [00:00<00:00, 367.34it/s]
+I OpFusing 2 : 100%|█████████████████████████████████████████████| 100/100 [00:00<00:00, 159.93it/s]
+I GraphPreparing : 100%|███████████████████████████████████████| 180/180 [00:00<00:00, 13429.65it/s]
+I Quantizating : 100%|████████████████████████████████████████████| 180/180 [00:10<00:00, 16.75it/s]
+W hybrid_quantization_step2: The node that pointed by '/model.22/Slice_3_output_0' is specaifed repeatedly!
+I OpFusing 0: 100%|█████████████████████████████████████████████| 100/100 [00:00<00:00, 5913.88it/s]
+I OpFusing 1 : 100%|████████████████████████████████████████████| 100/100 [00:00<00:00, 5443.12it/s]
+I OpFusing 2 : 100%|████████████████████████████████████████████| 100/100 [00:00<00:00, 5219.72it/s]
+W hybrid_quantization_step2: The default input dtype of 'images' is changed from 'float32' to 'int8' in rknn model for performance!
+                       Please take care of this change when deploy rknn model with Runtime API!
+W hybrid_quantization_step2: The default output dtype of '/model.22/Concat_1_output_0' is changed from 'float32' to 'int8' in rknn model for performance!
+                      Please take care of this change when deploy rknn model with Runtime API!
+W hybrid_quantization_step2: The default output dtype of '/model.22/Concat_2_output_0' is changed from 'float32' to 'int8' in rknn model for performance!
+                      Please take care of this change when deploy rknn model with Runtime API!
+W hybrid_quantization_step2: The default output dtype of '/model.22/Concat_3_output_0' is changed from 'float32' to 'int8' in rknn model for performance!
+                      Please take care of this change when deploy rknn model with Runtime API!
+W hybrid_quantization_step2: The default output dtype of '/model.22/Concat_6_output_0' is changed from 'float32' to 'float16' in rknn model for performance!
+                      Please take care of this change when deploy rknn model with Runtime API!
+I rknn building ...
+I rknn building done.
+done
+--> Export rknn model
+output_path: ../model/yolov8_pose.rknn
+done

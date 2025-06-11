@@ -1,0 +1,13 @@
+Detecting CXX compiler ABI info failed to compile with the following output:
+Change Dir: /home/radxa/Qworkspace/Qrknn/rknpu2/examples/yolov8_pose/cpp/build/CMakeFiles/CMakeScratch/TryCompile-Qld38w
+
+Run Build Command(s):/usr/bin/gmake -f Makefile cmTC_c71c1/fast && /usr/bin/gmake  -f CMakeFiles/cmTC_c71c1.dir/build.make CMakeFiles/cmTC_c71c1.dir/build
+gmake[1]: Entering directory '/home/radxa/Qworkspace/Qrknn/rknpu2/examples/yolov8_pose/cpp/build/CMakeFiles/CMakeScratch/TryCompile-Qld38w'
+Segmentation fault
+gmake[1]: *** [CMakeFiles/cmTC_c71c1.dir/build.make:77: CMakeFiles/cmTC_c71c1.dir/CMakeCXXCompilerABI.cpp.o] Error 139
+gmake[1]: Leaving directory '/home/radxa/Qworkspace/Qrknn/rknpu2/examples/yolov8_pose/cpp/build/CMakeFiles/CMakeScratch/TryCompile-Qld38w'
+gmake: *** [Makefile:127: cmTC_c71c1/fast] Error 2
+
+
+
+
