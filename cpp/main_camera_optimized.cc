@@ -1,23 +1,9 @@
-// Copyright (c) 2024 by Rockchip Electronics Co., Ltd. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 /*-------------------------------------------
-                性能优化版本 - NPU零拷贝
+                性能优化版本 - NPU零拷贝 Bquill 2025—5-16
                 
 用途: 消除CPU↔NPU内存拷贝开销，提升推理性能
 原理: 直接在NPU内存中进行预处理，避免数据传输
-优化效果: 相比基础版本性能提升100%
+优化效果: 相比基础版本性能提升100% (比较main.camera.cc)
 -------------------------------------------*/
 #include <stdint.h>
 #include <stdio.h>
@@ -98,7 +84,7 @@ static int init_zero_copy_mem(rknn_app_context_t* app_ctx, zero_copy_context_t* 
     zc_ctx->model_channels = app_ctx->model_channel;
     
     // 创建NPU直接访问的输入内存
-    // 为什么使用size_with_stride: NPU内存可能有对齐要求，stride确保正确访问
+    // 为什么使用size_with_stride: NPU内存有对齐要求，stride确保正确访问
     zc_ctx->input_mem = rknn_create_mem(app_ctx->rknn_ctx, zc_ctx->input_attr.size_with_stride);
     if (!zc_ctx->input_mem) {
         printf("创建输入零拷贝内存失败！\n");
@@ -108,7 +94,7 @@ static int init_zero_copy_mem(rknn_app_context_t* app_ctx, zero_copy_context_t* 
            zc_ctx->input_attr.size, zc_ctx->input_attr.size_with_stride);
     
     // 将NPU内存绑定到推理上下文
-    // 为什么需要绑定: 告诉NPU直接从这块内存读取数据，无需拷贝
+    // 告诉NPU直接从这块内存读取数据，无需拷贝
     ret = rknn_set_io_mem(app_ctx->rknn_ctx, zc_ctx->input_mem, &zc_ctx->input_attr);
     if (ret < 0) {
         printf("设置输入零拷贝内存失败! ret=%d\n", ret);
@@ -148,7 +134,7 @@ static void release_zero_copy_mem(rknn_app_context_t* app_ctx, zero_copy_context
 }
 
 // 优化的letterbox预处理，直接写入NPU内存
-// 为什么直接写入NPU内存: 避免CPU内存→NPU内存的拷贝开销
+// 直接写入NPU内存: 避免CPU内存→NPU内存的拷贝开销
 // letterbox原理: 保持图像比例的同时缩放到模型输入尺寸，多余部分用灰色填充
 static int optimized_letterbox_to_npu(cv::Mat& src_mat, zero_copy_context_t* zc_ctx, letterbox_ext_t* ext_info) {
     int dst_width = zc_ctx->model_width;
@@ -157,15 +143,13 @@ static int optimized_letterbox_to_npu(cv::Mat& src_mat, zero_copy_context_t* zc_
     int src_height = src_mat.rows;
     
     // 计算letterbox缩放参数
-    // 为什么取最小缩放比例: 确保图像完全包含在目标尺寸内，保持比例不变形
     float scale_w = (float)dst_width / src_width;
     float scale_h = (float)dst_height / src_height;
-    float scale = std::min(scale_w, scale_h);  // 选择较小的缩放比例
-    
-    int new_width = (int)(src_width * scale);   // 缩放后的实际宽度
-    int new_height = (int)(src_height * scale); // 缩放后的实际高度
-    int offset_x = (dst_width - new_width) / 2;  // 水平居中偏移
-    int offset_y = (dst_height - new_height) / 2; // 垂直居中偏移
+    float scale = std::min(scale_w, scale_h);
+    int new_width = (int)(src_width * scale);
+    int new_height = (int)(src_height * scale);
+    int offset_x = (dst_width - new_width) / 2;
+    int offset_y = (dst_height - new_height) / 2;
     
     // 填充扩展信息
     ext_info->scale = scale;
@@ -174,40 +158,23 @@ static int optimized_letterbox_to_npu(cv::Mat& src_mat, zero_copy_context_t* zc_
     ext_info->width = new_width;
     ext_info->height = new_height;
     
-    // 获取NPU内存指针 - 这是零拷贝的关键
+    // --- 调试打印 ---
+    printf("[DEBUG][letterbox] src=%dx%d, dst=%dx%d, scale=%.4f, offset_x=%d, offset_y=%d, new_size=%dx%d\n",
+        src_width, src_height, dst_width, dst_height, scale, offset_x, offset_y, new_width, new_height);
+    
+    // 获取NPU内存指针和步幅
     uint8_t* npu_ptr = (uint8_t*)zc_ctx->input_mem->virt_addr;
     int width_stride = zc_ctx->input_attr.w_stride;
-    
-    // 创建目标Mat，直接指向NPU内存
-    // 为什么直接指向NPU内存: OpenCV操作直接修改NPU内存，无需后续拷贝
-    cv::Mat dst_mat;
-    if (width_stride == dst_width) {
-        // 无内存对齐要求，直接使用
-        dst_mat = cv::Mat(dst_height, dst_width, CV_8UC3, npu_ptr);
-    } else {
-        // 有内存对齐要求(stride)，需要创建子区域
-        // 为什么需要stride: NPU硬件可能要求内存按特定边界对齐以提高访问效率
-        dst_mat = cv::Mat(dst_height, width_stride, CV_8UC3, npu_ptr);
-        dst_mat = dst_mat(cv::Rect(0, 0, dst_width, dst_height));
-    }
-    
-    // 填充背景色 (114,114,114) - 这是YOLO训练时使用的填充色
-    // 为什么用114灰色: 训练时使用的标准填充值，确保推理时一致性
+    printf("[DEBUG][letterbox] npu_ptr=%p, width_stride=%d\n", npu_ptr, width_stride);
+    // 以npu_ptr为起点，步幅为width_stride，创建整块Mat
+    cv::Mat dst_mat(dst_height, width_stride, CV_8UC3, npu_ptr);
     dst_mat.setTo(cv::Scalar(114, 114, 114));
-    
-    // 转换颜色空间 BGR->RGB
-    // 为什么需要转换: OpenCV默认BGR格式，而YOLO模型期望RGB格式
     cv::Mat src_rgb;
     cv::cvtColor(src_mat, src_rgb, cv::COLOR_BGR2RGB);
-    
-    // 调整大小并直接写入NPU内存的ROI区域
-    // 为什么在NPU内存中操作: 避免额外的内存拷贝，直接在目标内存完成预处理
     cv::Mat resized;
     cv::resize(src_rgb, resized, cv::Size(new_width, new_height));
-    
     cv::Mat roi = dst_mat(cv::Rect(offset_x, offset_y, new_width, new_height));
-    resized.copyTo(roi);  // 复制到NPU内存的ROI区域
-    
+    resized.copyTo(roi);
     return 0;
 }
 
@@ -215,50 +182,59 @@ static int optimized_letterbox_to_npu(cv::Mat& src_mat, zero_copy_context_t* zc_
 static int zero_copy_inference(rknn_app_context_t* app_ctx, zero_copy_context_t* zc_ctx, 
                               letterbox_ext_t* ext_info, object_detect_result_list* od_results) {
     int ret;
-    
-    // 直接运行推理 - 无需数据拷贝
+    // --- 调试打印模型输入属性 ---
+    printf("[DEBUG][input_attr] model_width=%d, model_height=%d, w_stride=%d, h_stride=%d, type=%d, fmt=%d\n",
+        zc_ctx->model_width, zc_ctx->model_height, zc_ctx->input_attr.w_stride, zc_ctx->input_attr.h_stride, zc_ctx->input_attr.type, zc_ctx->input_attr.fmt);
+    // --- 零拷贝输入设置 ---
+    rknn_input input;
+    input.index = 0;
+    input.buf = zc_ctx->input_mem->virt_addr;
+    input.size = zc_ctx->input_attr.size_with_stride;
+    input.pass_through = 1; // 直通模式，所有预处理都在CPU侧完成
+    input.type = zc_ctx->input_attr.type; // 与模型输入类型一致
+    input.fmt = zc_ctx->input_attr.fmt;   // 与模型输入格式一致
+    printf("[DEBUG][rknn_input] index=%d, buf=%p, size=%u, pass_through=%d, type=%d, fmt=%d\n",
+        input.index, input.buf, input.size, input.pass_through, input.type, input.fmt);
+    rknn_mem_sync(app_ctx->rknn_ctx, zc_ctx->input_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    ret = rknn_inputs_set(app_ctx->rknn_ctx, 1, &input);
+    if (ret < 0) {
+        printf("rknn_inputs_set 失败! ret=%d\n", ret);
+        return -1;
+    }
+    // --- 运行推理 ---
     int64_t start_time = getCurrentTimeUs();
     ret = rknn_run(app_ctx->rknn_ctx, NULL);
     int64_t inference_time = getCurrentTimeUs() - start_time;
-    
     if (ret < 0) {
         printf("rknn_run 失败! ret=%d\n", ret);
         return -1;
     }
-    
     printf("NPU推理时间=%.2fms, FPS=%.1f\n", 
            inference_time / 1000.0f, 1000000.0f / inference_time);
-    
-    // 获取输出结果 - 使用传统方式避免复杂的类型转换
+    // --- 获取输出 ---
     rknn_output outputs[app_ctx->io_num.n_output];
     memset(outputs, 0, sizeof(outputs));
     for (int i = 0; i < app_ctx->io_num.n_output; i++) {
         outputs[i].index = i;
         outputs[i].want_float = (!app_ctx->is_quant);
     }
-    
     int ret_get = rknn_outputs_get(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs, NULL);
     if (ret_get < 0) {
         printf("rknn_outputs_get 失败! ret=%d\n", ret_get);
         return -1;
     }
-    
-    // 后处理
+    // --- 后处理 ---
     letterbox_t letter_box;
     letter_box.scale = ext_info->scale;
     letter_box.x_pad = ext_info->x_offset;
     letter_box.y_pad = ext_info->y_offset;
-    
+    printf("[DEBUG][postprocess] scale=%.4f, x_pad=%d, y_pad=%d\n", letter_box.scale, letter_box.x_pad, letter_box.y_pad);
     start_time = getCurrentTimeUs();
     post_process(app_ctx, outputs, &letter_box, BOX_THRESH, NMS_THRESH, od_results);
     int64_t postprocess_time = getCurrentTimeUs() - start_time;
-    
     printf("后处理时间=%.2fms, FPS=%.1f\n", 
            postprocess_time / 1000.0f, 1000000.0f / postprocess_time);
-    
-    // 释放输出内存
     rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
-    
     return 0;
 }
 
@@ -334,11 +310,25 @@ int main(int argc, char **argv)
     
     printf("摄像头参数: %dx%d @ %.1fFPS, 格式: MJPEG\n",
            actual_width, actual_height, actual_fps);
-    printf("按Ctrl+C或ESC键退出\n\n");
-
-    // 创建窗口
-    cv::namedWindow("YOLOv8 Pose (优化版)", cv::WINDOW_NORMAL);
-    cv::resizeWindow("YOLOv8 Pose (优化版)", 640, 480);
+    
+    // 验证摄像头是否正常工作
+    cv::Mat test_frame;
+    if (!cap.read(test_frame)) {
+        printf("错误: 无法从摄像头读取测试帧!\n");
+        return -1;
+    }
+    printf("测试帧读取成功，大小: %dx%d\n", test_frame.cols, test_frame.rows);
+    
+    // 创建窗口并验证
+    const char* WINDOW_NAME = "YOLOv8 Pose (优化版)";
+    cv::namedWindow(WINDOW_NAME, cv::WINDOW_NORMAL);
+    cv::resizeWindow(WINDOW_NAME, 640, 480);
+    
+    // 显示测试图像
+    cv::imshow(WINDOW_NAME, test_frame);
+    printf("显示测试帧...\n");
+    cv::waitKey(1000); // 等待1秒
+    printf("测试帧显示完成\n");
 
     // 性能统计变量
     int frame_count = 0;
@@ -380,50 +370,42 @@ int main(int argc, char **argv)
         // 画框和关键点
         for (int i = 0; i < od_results.count; i++) {
             object_detect_result *det_result = &(od_results.results[i]);
-            
-            // 坐标变换
+            // 坐标变换参数
             float scale = letter_box_ext.scale;
             int x_offset = letter_box_ext.x_offset;
-            int y_offset = letter_box_ext.y_offset;
-            
+            //int y_offset = letter_box_ext.y_offset; // 不再使用y_offset
+            // 检测框反变换（只减x_offset，y方向直接用）
             int x1 = (det_result->box.left - x_offset) / scale;
-            int y1 = (det_result->box.top - y_offset) / scale;
+            int y1 = det_result->box.top; // 不再减y_offset
             int x2 = (det_result->box.right - x_offset) / scale;
-            int y2 = (det_result->box.bottom - y_offset) / scale;
-            
+            int y2 = det_result->box.bottom; // 不再减y_offset
             // 边界检查
             x1 = std::max(0, std::min(x1, frame.cols - 1));
             y1 = std::max(0, std::min(y1, frame.rows - 1));
             x2 = std::max(0, std::min(x2, frame.cols - 1));
             y2 = std::max(0, std::min(y2, frame.rows - 1));
-
+            printf("[box] raw: (%.1f,%.1f,%.1f,%.1f) -> pixel: (%d,%d,%d,%d)\n", det_result->box.left, det_result->box.top, det_result->box.right, det_result->box.bottom, x1, y1, x2, y2);
             // 画矩形框
             cv::rectangle(result_frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 2);
-
             // 显示置信度
             char text[256];
             sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
             cv::putText(result_frame, text, cv::Point(x1, y1 - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
-
-            // 转换关键点坐标并绘制
+            // 关键点反变换（只减x_offset，y方向直接用）
             float keypoints[17][2];
             for (int j = 0; j < 17; j++) {
                 keypoints[j][0] = (det_result->keypoints[j][0] - x_offset) / scale;
-                keypoints[j][1] = (det_result->keypoints[j][1] - y_offset) / scale;
-                
-                // 边界检查
+                keypoints[j][1] = det_result->keypoints[j][1]; // 不再减y_offset
                 keypoints[j][0] = std::max(0.0f, std::min(keypoints[j][0], (float)(frame.cols - 1)));
                 keypoints[j][1] = std::max(0.0f, std::min(keypoints[j][1], (float)(frame.rows - 1)));
             }
-            
             // 画骨架
             for (int j = 0; j < 38/2; ++j) {
                 cv::line(result_frame, 
                     cv::Point((int)(keypoints[skeleton[2*j]-1][0]), (int)(keypoints[skeleton[2*j]-1][1])),
                     cv::Point((int)(keypoints[skeleton[2*j+1]-1][0]), (int)(keypoints[skeleton[2*j+1]-1][1])),
-                    cv::Scalar(255, 128, 0), 2);
+                    cv::Scalar(0, 128, 255), 2); // 橙色BGR
             }
-            
             // 画关键点
             for (int j = 0; j < 17; ++j) {
                 cv::circle(result_frame, 
@@ -440,12 +422,17 @@ int main(int argc, char **argv)
         
         // 显示性能信息
         char perf_text[256];
-        sprintf(perf_text, "帧FPS: %.1f | 平均FPS: %.1f | 零拷贝优化", 
+        sprintf(perf_text, "Frame FPS: %.1f | Average FPS: %.1f | NPU Zero Copy", 
                 frame_fps, frame_count * 1000000.0f / total_time);
         cv::putText(result_frame, perf_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
 
         // 显示结果
-        cv::imshow("YOLOv8 Pose (优化版)", result_frame);
+        if(!result_frame.empty()) {
+            printf("显示帧大小: %dx%d\n", result_frame.cols, result_frame.rows);
+            cv::imshow(WINDOW_NAME, result_frame);
+        } else {
+            printf("警告: 结果帧为空!\n");
+        }
 
         // 每10秒输出性能统计
         if (frame_count % 100 == 0) {
