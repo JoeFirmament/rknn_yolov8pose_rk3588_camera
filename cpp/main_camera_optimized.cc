@@ -12,14 +12,19 @@
 #include <sys/time.h>
 #include <signal.h>
 #include <memory>
+#include <chrono>
 
 // OpenCV头文件
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/persistence.hpp>  // 用于读取XML文件
 
 #include "yolov8-pose.h"
 #include "image_utils.h"
 #include "file_utils.h"
 #include "image_drawing.h"
+
+// 在文件顶部添加alpha参数宏
+#define UNDISTORT_ALPHA 0.0  // 可调0.0~1.0，0为无黑边，1为最大视野 特别注意 这里的a'l
 
 int skeleton[38] ={16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 6, 8, 
             7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7}; 
@@ -48,6 +53,19 @@ typedef struct {
     int height;        // 缩放后的实际高度
     float scale;       // 缩放比例，用于坐标反变换
 } letterbox_ext_t;
+
+// 添加相机标定和Homography相关的结构体
+typedef struct {
+    cv::Mat camera_matrix;    // 相机内参矩阵
+    cv::Mat dist_coeffs;      // 畸变系数
+    cv::Mat homography;       // 单应性矩阵
+    bool is_initialized;      // 是否已初始化
+    int calib_width;          // 标定分辨率宽
+    int calib_height;         // 标定分辨率高
+} camera_mapping_t;
+
+// 全局变量
+camera_mapping_t g_camera_mapping = {};
 
 // 信号处理函数
 void sig_handler(int signo) {
@@ -141,7 +159,6 @@ static int optimized_letterbox_to_npu(cv::Mat& src_mat, zero_copy_context_t* zc_
     int dst_height = zc_ctx->model_height;
     int src_width = src_mat.cols;
     int src_height = src_mat.rows;
-    
     // 计算letterbox缩放参数
     float scale_w = (float)dst_width / src_width;
     float scale_h = (float)dst_height / src_height;
@@ -150,22 +167,15 @@ static int optimized_letterbox_to_npu(cv::Mat& src_mat, zero_copy_context_t* zc_
     int new_height = (int)(src_height * scale);
     int offset_x = (dst_width - new_width) / 2;
     int offset_y = (dst_height - new_height) / 2;
-    
     // 填充扩展信息
     ext_info->scale = scale;
     ext_info->x_offset = offset_x;
     ext_info->y_offset = offset_y;
     ext_info->width = new_width;
     ext_info->height = new_height;
-    
-    // --- 调试打印 ---
-    printf("[DEBUG][letterbox] src=%dx%d, dst=%dx%d, scale=%.4f, offset_x=%d, offset_y=%d, new_size=%dx%d\n",
-        src_width, src_height, dst_width, dst_height, scale, offset_x, offset_y, new_width, new_height);
-    
     // 获取NPU内存指针和步幅
     uint8_t* npu_ptr = (uint8_t*)zc_ctx->input_mem->virt_addr;
     int width_stride = zc_ctx->input_attr.w_stride;
-    printf("[DEBUG][letterbox] npu_ptr=%p, width_stride=%d\n", npu_ptr, width_stride);
     // 以npu_ptr为起点，步幅为width_stride，创建整块Mat
     cv::Mat dst_mat(dst_height, width_stride, CV_8UC3, npu_ptr);
     dst_mat.setTo(cv::Scalar(114, 114, 114));
@@ -182,9 +192,6 @@ static int optimized_letterbox_to_npu(cv::Mat& src_mat, zero_copy_context_t* zc_
 static int zero_copy_inference(rknn_app_context_t* app_ctx, zero_copy_context_t* zc_ctx, 
                               letterbox_ext_t* ext_info, object_detect_result_list* od_results) {
     int ret;
-    // --- 调试打印模型输入属性 ---
-    printf("[DEBUG][input_attr] model_width=%d, model_height=%d, w_stride=%d, h_stride=%d, type=%d, fmt=%d\n",
-        zc_ctx->model_width, zc_ctx->model_height, zc_ctx->input_attr.w_stride, zc_ctx->input_attr.h_stride, zc_ctx->input_attr.type, zc_ctx->input_attr.fmt);
     // --- 零拷贝输入设置 ---
     rknn_input input;
     input.index = 0;
@@ -193,8 +200,6 @@ static int zero_copy_inference(rknn_app_context_t* app_ctx, zero_copy_context_t*
     input.pass_through = 1; // 直通模式，所有预处理都在CPU侧完成
     input.type = zc_ctx->input_attr.type; // 与模型输入类型一致
     input.fmt = zc_ctx->input_attr.fmt;   // 与模型输入格式一致
-    printf("[DEBUG][rknn_input] index=%d, buf=%p, size=%u, pass_through=%d, type=%d, fmt=%d\n",
-        input.index, input.buf, input.size, input.pass_through, input.type, input.fmt);
     rknn_mem_sync(app_ctx->rknn_ctx, zc_ctx->input_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
     ret = rknn_inputs_set(app_ctx->rknn_ctx, 1, &input);
     if (ret < 0) {
@@ -228,7 +233,6 @@ static int zero_copy_inference(rknn_app_context_t* app_ctx, zero_copy_context_t*
     letter_box.scale = ext_info->scale;
     letter_box.x_pad = ext_info->x_offset;
     letter_box.y_pad = ext_info->y_offset;
-    printf("[DEBUG][postprocess] scale=%.4f, x_pad=%d, y_pad=%d\n", letter_box.scale, letter_box.x_pad, letter_box.y_pad);
     start_time = getCurrentTimeUs();
     post_process(app_ctx, outputs, &letter_box, BOX_THRESH, NMS_THRESH, od_results);
     int64_t postprocess_time = getCurrentTimeUs() - start_time;
@@ -236,6 +240,136 @@ static int zero_copy_inference(rknn_app_context_t* app_ctx, zero_copy_context_t*
            postprocess_time / 1000.0f, 1000000.0f / postprocess_time);
     rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
     return 0;
+}
+
+// 初始化相机标定和Homography
+static int init_camera_mapping() {
+    // 获取当前可执行文件所在目录
+    char exe_path[256];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len != -1) {
+        exe_path[len] = '\0';
+        char* last_slash = strrchr(exe_path, '/');
+        if (last_slash) {
+            *(last_slash + 1) = '\0';
+        }
+    } else {
+        strcpy(exe_path, "./");
+    }
+
+    // 构建XML文件路径
+    char calib_path[512];
+    char homo_path[512];
+    snprintf(calib_path, sizeof(calib_path), "%scamera_calibration.xml", exe_path);
+    snprintf(homo_path, sizeof(homo_path), "%shomography.xml", exe_path);
+
+    printf("加载相机标定文件: %s\n", calib_path);
+    printf("加载Homography文件: %s\n", homo_path);
+
+    // 读取相机标定参数
+    cv::FileStorage fs_calib(calib_path, cv::FileStorage::READ);
+    if (!fs_calib.isOpened()) {
+        printf("错误: 无法打开相机标定文件 %s\n", calib_path);
+        return -1;
+    }
+
+    // 读取标定时的图像尺寸
+    int calib_width = (int)fs_calib["image_width"];
+    int calib_height = (int)fs_calib["image_height"];
+    printf("标定图像尺寸: %dx%d\n", calib_width, calib_height);
+    g_camera_mapping.calib_width = calib_width;
+    g_camera_mapping.calib_height = calib_height;
+
+    // 读取并验证相机内参矩阵
+    fs_calib["camera_matrix"] >> g_camera_mapping.camera_matrix;
+    std::cout << "[DEBUG] camera_matrix: " << g_camera_mapping.camera_matrix << std::endl;
+    std::cout << "[DEBUG] camera_matrix size: " << g_camera_mapping.camera_matrix.rows << "x" << g_camera_mapping.camera_matrix.cols << std::endl;
+    if (g_camera_mapping.camera_matrix.empty()) {
+        printf("错误: 相机内参矩阵为空\n");
+        return -1;
+    }
+
+    // 读取并验证畸变系数
+    fs_calib["dist_coeffs"] >> g_camera_mapping.dist_coeffs;
+    std::cout << "[DEBUG] dist_coeffs: " << g_camera_mapping.dist_coeffs << std::endl;
+    std::cout << "[DEBUG] dist_coeffs size: " << g_camera_mapping.dist_coeffs.rows << "x" << g_camera_mapping.dist_coeffs.cols << std::endl;
+    if (g_camera_mapping.dist_coeffs.empty()) {
+        printf("错误: 畸变系数为空\n");
+        return -1;
+    }
+
+    fs_calib.release();
+
+    // 读取Homography矩阵
+    cv::FileStorage fs_homo(homo_path, cv::FileStorage::READ);
+    if (!fs_homo.isOpened()) {
+        printf("错误: 无法打开Homography文件 %s\n", homo_path);
+        return -1;
+    }
+
+    fs_homo["homography_matrix"] >> g_camera_mapping.homography;
+    std::cout << "[DEBUG] homography_matrix: " << g_camera_mapping.homography << std::endl;
+    std::cout << "[DEBUG] homography_matrix size: " << g_camera_mapping.homography.rows << "x" << g_camera_mapping.homography.cols << std::endl;
+    if (g_camera_mapping.homography.empty()) {
+        printf("错误: Homography矩阵为空\n");
+        return -1;
+    }
+
+    fs_homo.release();
+
+    // 验证矩阵维度
+    if (g_camera_mapping.camera_matrix.rows != 3 || g_camera_mapping.camera_matrix.cols != 3 ||
+        g_camera_mapping.homography.rows != 3 || g_camera_mapping.homography.cols != 3) {
+        printf("错误: 矩阵维度不正确\n");
+        return -1;
+    }
+
+    g_camera_mapping.is_initialized = true;
+    printf("相机标定和Homography初始化成功\n");
+    return 0;
+}
+
+// 根据实际分辨率缩放相机内参矩阵
+static void scale_camera_matrix(cv::Mat& camera_matrix, 
+                              int calib_width, int calib_height,
+                              int actual_width, int actual_height) {
+    double scale_x = (double)actual_width / (double)calib_width;
+    double scale_y = (double)actual_height / (double)calib_height;
+    // 只缩放fx, fy, cx, cy，不重复缩放
+    camera_matrix.at<double>(0,0) = camera_matrix.at<double>(0,0) * scale_x;  // fx
+    camera_matrix.at<double>(1,1) = camera_matrix.at<double>(1,1) * scale_y;  // fy
+    camera_matrix.at<double>(0,2) = camera_matrix.at<double>(0,2) * scale_x;  // cx
+    camera_matrix.at<double>(1,2) = camera_matrix.at<double>(1,2) * scale_y;  // cy
+}
+
+// 计算脚点中心并映射到地面坐标
+static cv::Point2f calculate_foot_position(const float keypoints[17][2]) {
+    // 获取左右脚点（COCO格式中，左脚点是15，右脚点是16）
+    cv::Point2f left_foot(keypoints[15][0], keypoints[15][1]);
+    cv::Point2f right_foot(keypoints[16][0], keypoints[16][1]);
+    
+    // 计算脚点中心
+    cv::Point2f foot_center = (left_foot + right_foot) * 0.5f;
+    return foot_center;
+}
+
+// 将图像坐标映射到地面坐标
+static cv::Point2f map_to_ground(const cv::Point2f& image_point) {
+    if (!g_camera_mapping.is_initialized) {
+        return cv::Point2f(-1, -1);
+    }
+
+    std::vector<cv::Point2f> src_points = {image_point};
+    std::vector<cv::Point2f> dst_points;
+    cv::perspectiveTransform(src_points, dst_points, g_camera_mapping.homography);
+    return dst_points[0];
+}
+
+// 计算两点之间的欧氏距离（单位：毫米）
+static float calculate_distance(const cv::Point2f& p1, const cv::Point2f& p2) {
+    float dx = p2.x - p1.x;
+    float dy = p2.y - p1.y;
+    return std::sqrt(dx*dx + dy*dy);
 }
 
 /*-------------------------------------------
@@ -287,8 +421,19 @@ int main(int argc, char **argv)
         return -1;
     }
 
+    // 初始化相机标定和Homography
+    printf("\n=== 初始化相机标定和Homography ===\n");
+    ret = init_camera_mapping();
+    if (ret != 0) {
+        printf("错误: 相机标定和Homography初始化失败!\n");
+        printf("请确保XML文件位于正确位置，且格式正确\n");
+        return -1;
+    }
+    printf("=== 相机标定和Homography初始化完成 ===\n\n");
+
     // 打开摄像头
-    cv::VideoCapture cap(0);
+//注意⚠️：这里需要使用cv::CAP_V4L2，否则会默认调用 GStreamer，导致无法正常采集帧率。
+    cv::VideoCapture cap(0, cv::CAP_V4L2);
     if (!cap.isOpened()) {
         printf("摄像头打开失败\n");
         release_zero_copy_mem(&rknn_app_ctx, &zero_copy_ctx);
@@ -297,27 +442,43 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    // 设置摄像头参数
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    // 严格设置MJPG格式和1920x1080分辨率
     cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-    cap.set(cv::CAP_PROP_FPS, 30);
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+    usleep(200*1000); // 延时200ms，部分驱动需要
 
     // 获取实际的摄像头参数
     int actual_width = cap.get(cv::CAP_PROP_FRAME_WIDTH);
     int actual_height = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
     double actual_fps = cap.get(cv::CAP_PROP_FPS);
-    
-    printf("摄像头参数: %dx%d @ %.1fFPS, 格式: MJPEG\n",
-           actual_width, actual_height, actual_fps);
-    
+    printf("摄像头参数: %dx%d @ %.1fFPS, 格式: MJPEG\n", actual_width, actual_height, actual_fps);
+
+    // 采集100帧并统计FPS（与fps_test.cc一致）
+    cv::Mat fps_test_frame;
+    int fps_count = 0;
+    int fps_total = 100;
+    auto fps_start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < fps_total; ++i) {
+        if (!cap.read(fps_test_frame)) {
+            printf("采集失败\n");
+            break;
+        }
+        fps_count++;
+    }
+    auto fps_end = std::chrono::high_resolution_clock::now();
+    double fps_seconds = std::chrono::duration<double>(fps_end - fps_start).count();
+    printf("主程序采集帧率: %.2f FPS (共%d帧, %.2f秒)\n", fps_count / fps_seconds, fps_count, fps_seconds);
+    printf("最后一帧尺寸: %dx%d\n", fps_test_frame.cols, fps_test_frame.rows);
+
     // 验证摄像头是否正常工作
     cv::Mat test_frame;
     if (!cap.read(test_frame)) {
         printf("错误: 无法从摄像头读取测试帧!\n");
         return -1;
     }
-    printf("测试帧读取成功，大小: %dx%d\n", test_frame.cols, test_frame.rows);
+    printf("采集帧尺寸: %dx%d\n", test_frame.cols, test_frame.rows);
+    printf("cap.get尺寸: %dx%d\n", (int)cap.get(cv::CAP_PROP_FRAME_WIDTH), (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT));
     
     // 创建窗口并验证
     const char* WINDOW_NAME = "YOLOv8 Pose (优化版)";
@@ -335,119 +496,124 @@ int main(int argc, char **argv)
     int64_t total_time = 0;
     int64_t start_time_overall = getCurrentTimeUs();
 
+    // remap map缓存静态变量
+    static cv::Mat map1, map2;
+    static cv::Size last_size(-1, -1);
+    static cv::Mat last_camera_matrix, last_dist_coeffs;
+    static double last_alpha = -1.0;
+    static cv::Rect last_valid_roi;
+
     // 主循环
     while (g_running) {
+        int64_t t0 = getCurrentTimeUs();
         cv::Mat frame;
-        int64_t frame_start_time = getCurrentTimeUs();
-        
-        // 捕获一帧
-        if (!cap.read(frame)) {
-            printf("读取帧失败\n");
-            break;
+        // 采集
+        cap.read(frame);
+        int64_t t1 = getCurrentTimeUs();
+        // remap map方案高效undistort
+        if (last_size != frame.size() || last_camera_matrix.empty() || last_dist_coeffs.empty() || last_alpha != UNDISTORT_ALPHA) {
+            cv::Mat new_camera_matrix;
+            cv::Rect valid_roi;
+            new_camera_matrix = cv::getOptimalNewCameraMatrix(
+                g_camera_mapping.camera_matrix,
+                g_camera_mapping.dist_coeffs,
+                frame.size(),
+                UNDISTORT_ALPHA,
+                frame.size(),
+                &valid_roi
+            );
+            cv::initUndistortRectifyMap(
+                g_camera_mapping.camera_matrix,
+                g_camera_mapping.dist_coeffs,
+                cv::Mat(),
+                new_camera_matrix,
+                frame.size(),
+                CV_16SC2,
+                map1, map2
+            );
+            last_size = frame.size();
+            last_camera_matrix = g_camera_mapping.camera_matrix.clone();
+            last_dist_coeffs = g_camera_mapping.dist_coeffs.clone();
+            last_alpha = UNDISTORT_ALPHA;
+            last_valid_roi = valid_roi;
         }
-
+        cv::Mat undistorted;
+        cv::remap(frame, undistorted, map1, map2, cv::INTER_LINEAR);
+        int64_t t2 = getCurrentTimeUs();
+        // 裁剪ROI
+        cv::Mat undistorted_roi = undistorted(last_valid_roi);
+        // resize到YOLO输入
+        cv::Mat yolo_input;
+        int yolo_width = zero_copy_ctx.model_width;
+        int yolo_height = zero_copy_ctx.model_height;
+        cv::resize(undistorted_roi, yolo_input, cv::Size(yolo_width, yolo_height));
+        int64_t t3 = getCurrentTimeUs();
         // 优化的预处理 - 直接写入NPU内存
         letterbox_ext_t letter_box_ext;
-        ret = optimized_letterbox_to_npu(frame, &zero_copy_ctx, &letter_box_ext);
+        ret = optimized_letterbox_to_npu(yolo_input, &zero_copy_ctx, &letter_box_ext);
         if (ret != 0) {
             printf("预处理失败\n");
             continue;
         }
-
         // 零拷贝推理
         object_detect_result_list od_results;
+        int64_t t4 = getCurrentTimeUs();
         ret = zero_copy_inference(&rknn_app_ctx, &zero_copy_ctx, &letter_box_ext, &od_results);
+        int64_t t5 = getCurrentTimeUs();
         if (ret != 0) {
             printf("推理失败\n");
             continue;
         }
-
-        printf("检测到 %d 个对象\n", od_results.count);
-
         // 绘制结果
-        cv::Mat result_frame = frame.clone();
-        
-        // 画框和关键点
+        cv::Mat result_frame = undistorted_roi.clone();
+        float scale_x = (float)undistorted_roi.cols / (float)yolo_width;
+        float scale_y = (float)undistorted_roi.rows / (float)yolo_height;
         for (int i = 0; i < od_results.count; i++) {
             object_detect_result *det_result = &(od_results.results[i]);
-            // 坐标变换参数
-            float scale = letter_box_ext.scale;
-            int x_offset = letter_box_ext.x_offset;
-            //int y_offset = letter_box_ext.y_offset; // 不再使用y_offset
-            // 检测框反变换（只减x_offset，y方向直接用）
-            int x1 = (det_result->box.left - x_offset) / scale;
-            int y1 = det_result->box.top; // 不再减y_offset
-            int x2 = (det_result->box.right - x_offset) / scale;
-            int y2 = det_result->box.bottom; // 不再减y_offset
-            // 边界检查
-            x1 = std::max(0, std::min(x1, frame.cols - 1));
-            y1 = std::max(0, std::min(y1, frame.rows - 1));
-            x2 = std::max(0, std::min(x2, frame.cols - 1));
-            y2 = std::max(0, std::min(y2, frame.rows - 1));
-            printf("[box] raw: (%.1f,%.1f,%.1f,%.1f) -> pixel: (%d,%d,%d,%d)\n", det_result->box.left, det_result->box.top, det_result->box.right, det_result->box.bottom, x1, y1, x2, y2);
-            // 画矩形框
-            cv::rectangle(result_frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 2);
-            // 显示置信度
-            char text[256];
-            sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-            cv::putText(result_frame, text, cv::Point(x1, y1 - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
-            // 关键点反变换（只减x_offset，y方向直接用）
             float keypoints[17][2];
             for (int j = 0; j < 17; j++) {
-                keypoints[j][0] = (det_result->keypoints[j][0] - x_offset) / scale;
-                keypoints[j][1] = det_result->keypoints[j][1]; // 不再减y_offset
-                keypoints[j][0] = std::max(0.0f, std::min(keypoints[j][0], (float)(frame.cols - 1)));
-                keypoints[j][1] = std::max(0.0f, std::min(keypoints[j][1], (float)(frame.rows - 1)));
+                keypoints[j][0] = det_result->keypoints[j][0] * scale_x;
+                keypoints[j][1] = det_result->keypoints[j][1] * scale_y;
+                keypoints[j][0] = std::max(0.0f, std::min(keypoints[j][0], (float)(undistorted_roi.cols - 1)));
+                keypoints[j][1] = std::max(0.0f, std::min(keypoints[j][1], (float)(undistorted_roi.rows - 1)));
             }
-            // 画骨架
             for (int j = 0; j < 38/2; ++j) {
                 cv::line(result_frame, 
                     cv::Point((int)(keypoints[skeleton[2*j]-1][0]), (int)(keypoints[skeleton[2*j]-1][1])),
                     cv::Point((int)(keypoints[skeleton[2*j+1]-1][0]), (int)(keypoints[skeleton[2*j+1]-1][1])),
-                    cv::Scalar(0, 128, 255), 2); // 橙色BGR
+                    cv::Scalar(0, 128, 255), 2);
             }
-            // 画关键点
             for (int j = 0; j < 17; ++j) {
                 cv::circle(result_frame, 
                     cv::Point((int)(keypoints[j][0]), (int)(keypoints[j][1])),
                     3, cv::Scalar(255, 255, 0), -1);
             }
+            cv::Point2f foot_center = calculate_foot_position(keypoints);
+            cv::Point2f ground_point = map_to_ground(foot_center);
+            if (ground_point.x >= 0 && ground_point.y >= 0) {
+                char dist_text[256];
+                sprintf(dist_text, "距离: (%.1f, %.1f)mm", ground_point.x, ground_point.y);
+                cv::putText(result_frame, dist_text, 
+                           cv::Point((int)foot_center.x, (int)foot_center.y + 30), 
+                           cv::FONT_HERSHEY_SIMPLEX, 
+                           0.5, cv::Scalar(255, 0, 0), 2);
+            }
         }
-
-        // 计算帧FPS
-        int64_t frame_time = getCurrentTimeUs() - frame_start_time;
-        float frame_fps = 1000000.0f / frame_time;
-        total_time += frame_time;
-        frame_count++;
-        
-        // 显示性能信息
+        int64_t t6 = getCurrentTimeUs();
+        // 显示性能profile
+        printf("[profile] cap:%.2fms undistort:%.2fms resize:%.2fms npu:%.2fms draw:%.2fms\n",
+            (t1-t0)/1000.0, (t2-t1)/1000.0, (t3-t2)/1000.0, (t5-t4)/1000.0, (t6-t5)/1000.0);
         char perf_text[256];
-        sprintf(perf_text, "Frame FPS: %.1f | Average FPS: %.1f | NPU Zero Copy", 
-                frame_fps, frame_count * 1000000.0f / total_time);
+        sprintf(perf_text, "FPS: %.1f", frame_count * 1000000.0f / total_time);
         cv::putText(result_frame, perf_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-
-        // 显示结果
-        if(!result_frame.empty()) {
-            printf("显示帧大小: %dx%d\n", result_frame.cols, result_frame.rows);
-            cv::imshow(WINDOW_NAME, result_frame);
-        } else {
-            printf("警告: 结果帧为空!\n");
-        }
-
-        // 每10秒输出性能统计
-        if (frame_count % 100 == 0) {
-            float avg_fps = frame_count * 1000000.0f / total_time;
-            printf("=== 性能统计 (第%d帧) ===\n", frame_count);
-            printf("平均FPS: %.2f\n", avg_fps);
-            printf("平均帧时间: %.2fms\n", total_time / (frame_count * 1000.0f));
-            printf("优化效果: NPU零拷贝已启用\n\n");
-        }
-
-        // 等待按键
+        cv::imshow(WINDOW_NAME, result_frame);
         int key = cv::waitKey(1);
         if (key == 27) { // ESC键
             break;
         }
+        int64_t frame_time = t6 - t0;
+        total_time += frame_time;
+        frame_count++;
     }
 
     // 最终性能报告
