@@ -22,9 +22,14 @@
 #include "image_utils.h"
 #include "file_utils.h"
 #include "image_drawing.h"
+#include <bytetrack/BYTETracker.h>
+#include "im2d.h"
+#include "im2d_type.h"
+#include "im2d_single.h"
+#include "RgaUtils.h"
 
 // 在文件顶部添加alpha参数宏
-#define UNDISTORT_ALPHA 0.0  // 可调0.0~1.0，0为无黑边，1为最大视野 特别注意 这里的a'l
+#define UNDISTORT_ALPHA 0.0  // 可调0.0~1.0，0为无黑边，1为最大视野 特别注意 这里的alpha是反的 0.0是最大视野 1.0是最大黑边⚠️
 
 int skeleton[38] ={16, 14, 14, 12, 17, 15, 15, 13, 12, 13, 6, 12, 7, 13, 6, 7, 6, 8, 
             7, 9, 8, 10, 9, 11, 2, 3, 1, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 7}; 
@@ -66,6 +71,9 @@ typedef struct {
 
 // 全局变量
 camera_mapping_t g_camera_mapping = {};
+
+// 在全局变量部分添加ByteTrack实例
+BYTETracker g_byte_track;
 
 // 信号处理函数
 void sig_handler(int signo) {
@@ -190,7 +198,7 @@ static int optimized_letterbox_to_npu(cv::Mat& src_mat, zero_copy_context_t* zc_
 
 // 零拷贝推理函数
 static int zero_copy_inference(rknn_app_context_t* app_ctx, zero_copy_context_t* zc_ctx, 
-                              letterbox_ext_t* ext_info, object_detect_result_list* od_results) {
+                              letterbox_ext_t* ext_info, object_detect_result_list* od_results, std::vector<Object>& objects, float scale_x, float scale_y) {
     int ret;
     // --- 零拷贝输入设置 ---
     rknn_input input;
@@ -239,6 +247,20 @@ static int zero_copy_inference(rknn_app_context_t* app_ctx, zero_copy_context_t*
     printf("后处理时间=%.2fms, FPS=%.1f\n", 
            postprocess_time / 1000.0f, 1000000.0f / postprocess_time);
     rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
+
+    // 生成BYTETracker所需objects
+    objects.clear();
+    for (int i = 0; i < od_results->count; i++) {
+        Object obj;
+        float left   = od_results->results[i].box.left   * scale_x;
+        float top    = od_results->results[i].box.top    * scale_y;
+        float right  = od_results->results[i].box.right  * scale_x;
+        float bottom = od_results->results[i].box.bottom * scale_y;
+        obj.classId = od_results->results[i].cls_id;
+        obj.score = od_results->results[i].prop;
+        obj.box = cv::Rect_<float>(left, top, right - left, bottom - top);
+        objects.push_back(obj);
+    }
     return 0;
 }
 
@@ -343,18 +365,37 @@ static void scale_camera_matrix(cv::Mat& camera_matrix,
 }
 
 // 计算脚点中心并映射到地面坐标
-static cv::Point2f calculate_foot_position(const float keypoints[17][2]) {
+static cv::Point2f calculate_foot_position(const float keypoints[17][2], cv::Mat& debug_frame) {
     // 获取左右脚点（COCO格式中，左脚点是15，右脚点是16）
     cv::Point2f left_foot(keypoints[15][0], keypoints[15][1]);
     cv::Point2f right_foot(keypoints[16][0], keypoints[16][1]);
     
+    // 绘制左右脚点（使用不同颜色区分）
+    cv::circle(debug_frame, left_foot, 5, cv::Scalar(0, 0, 255), -1);  // 红色表示左脚
+    cv::circle(debug_frame, right_foot, 5, cv::Scalar(255, 0, 0), -1); // 蓝色表示右脚
+    
     // 计算脚点中心
     cv::Point2f foot_center = (left_foot + right_foot) * 0.5f;
+    
+    // 绘制脚点中心（绿色）
+    cv::circle(debug_frame, foot_center, 8, cv::Scalar(0, 255, 0), 2);
+    
+    // 绘制连接线
+    cv::line(debug_frame, left_foot, right_foot, cv::Scalar(255, 255, 0), 2);
+    
+    // 添加脚点标签
+    cv::putText(debug_frame, "L", cv::Point(left_foot.x + 10, left_foot.y), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+    cv::putText(debug_frame, "R", cv::Point(right_foot.x + 10, right_foot.y), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+    cv::putText(debug_frame, "C", cv::Point(foot_center.x + 10, foot_center.y), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+    
     return foot_center;
 }
 
 // 将图像坐标映射到地面坐标
-static cv::Point2f map_to_ground(const cv::Point2f& image_point) {
+static cv::Point2f map_to_ground(const cv::Point2f& image_point, cv::Mat& debug_frame) {
     if (!g_camera_mapping.is_initialized) {
         return cv::Point2f(-1, -1);
     }
@@ -362,7 +403,28 @@ static cv::Point2f map_to_ground(const cv::Point2f& image_point) {
     std::vector<cv::Point2f> src_points = {image_point};
     std::vector<cv::Point2f> dst_points;
     cv::perspectiveTransform(src_points, dst_points, g_camera_mapping.homography);
-    return dst_points[0];
+    
+    // 在调试图像上绘制映射关系
+    cv::Point2f ground_point = dst_points[0];
+    if (ground_point.x >= 0 && ground_point.y >= 0) {
+        // 绘制从图像点到地面点的映射线
+        cv::line(debug_frame, image_point, 
+                cv::Point(image_point.x, image_point.y + 50), 
+                cv::Scalar(0, 255, 255), 2);
+                
+        // 显示映射误差
+        std::vector<cv::Point2f> back_points;
+        cv::perspectiveTransform(dst_points, back_points, g_camera_mapping.homography.inv());
+        float error = cv::norm(back_points[0] - image_point);
+        
+        char error_text[64];
+        sprintf(error_text, "Error: %.1fpx", error);
+        cv::putText(debug_frame, error_text,
+                   cv::Point(image_point.x + 10, image_point.y + 70),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 2);
+    }
+    
+    return ground_point;
 }
 
 // 计算两点之间的欧氏距离（单位：毫米）
@@ -370,6 +432,62 @@ static float calculate_distance(const cv::Point2f& p1, const cv::Point2f& p2) {
     float dx = p2.x - p1.x;
     float dy = p2.y - p1.y;
     return std::sqrt(dx*dx + dy*dy);
+}
+
+// 绘制地面网格参考线
+static void draw_ground_grid(cv::Mat& frame, const cv::Mat& homography, int grid_size = 100, int num_lines = 10) {
+    if (homography.empty()) return;
+    
+    // 计算网格线的起点和终点
+    std::vector<cv::Point2f> grid_points;
+    for (int i = -num_lines/2; i <= num_lines/2; i++) {
+        // 水平线
+        grid_points.push_back(cv::Point2f(-num_lines/2 * grid_size, i * grid_size));
+        grid_points.push_back(cv::Point2f(num_lines/2 * grid_size, i * grid_size));
+        
+        // 垂直线
+        grid_points.push_back(cv::Point2f(i * grid_size, -num_lines/2 * grid_size));
+        grid_points.push_back(cv::Point2f(i * grid_size, num_lines/2 * grid_size));
+    }
+    
+    // 将地面坐标转换为图像坐标
+    std::vector<cv::Point2f> image_points;
+    cv::perspectiveTransform(grid_points, image_points, homography.inv());
+    
+    // 绘制网格线
+    for (size_t i = 0; i < image_points.size(); i += 2) {
+        cv::line(frame, image_points[i], image_points[i+1], cv::Scalar(0, 255, 0), 1);
+    }
+    
+    // 绘制坐标轴
+    cv::Point2f origin(0, 0);
+    cv::Point2f x_axis(grid_size, 0);
+    cv::Point2f y_axis(0, grid_size);
+    
+    std::vector<cv::Point2f> axis_points = {origin, x_axis, y_axis};
+    std::vector<cv::Point2f> axis_image_points;
+    cv::perspectiveTransform(axis_points, axis_image_points, homography.inv());
+    
+    // 绘制X轴（红色）
+    cv::line(frame, axis_image_points[0], axis_image_points[1], cv::Scalar(0, 0, 255), 2);
+    cv::putText(frame, "X", axis_image_points[1], cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+    
+    // 绘制Y轴（蓝色）
+    cv::line(frame, axis_image_points[0], axis_image_points[2], cv::Scalar(255, 0, 0), 2);
+    cv::putText(frame, "Y", axis_image_points[2], cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+}
+
+// 新增 RGA resize 封装
+static int rga_resize(const cv::Mat& src, cv::Mat& dst, int dst_width, int dst_height) {
+    dst.create(dst_height, dst_width, src.type());
+    rga_buffer_t src_buf = wrapbuffer_virtualaddr((void*)src.data, src.cols, src.rows, RK_FORMAT_BGR_888);
+    rga_buffer_t dst_buf = wrapbuffer_virtualaddr((void*)dst.data, dst.cols, dst.rows, RK_FORMAT_BGR_888);
+    IM_STATUS status = imresize(src_buf, dst_buf);
+    if (status != IM_STATUS_SUCCESS) {
+        printf("[RGA] imresize failed: %s\n", imStrError(status));
+        return -1;
+    }
+    return 0;
 }
 
 /*-------------------------------------------
@@ -506,6 +624,7 @@ int main(int argc, char **argv)
     // 主循环
     while (g_running) {
         int64_t t0 = getCurrentTimeUs();
+        int64_t t_track0 = 0, t_track1 = 0; // 修正：声明在循环顶部
         cv::Mat frame;
         // 采集
         cap.read(frame);
@@ -537,28 +656,49 @@ int main(int argc, char **argv)
             last_alpha = UNDISTORT_ALPHA;
             last_valid_roi = valid_roi;
         }
-        cv::Mat undistorted;
-        cv::remap(frame, undistorted, map1, map2, cv::INTER_LINEAR);
+        
+        // --- OpenCV undistort ---
+        int64_t t2_start = getCurrentTimeUs();
+        cv::Mat undistorted(frame.size(), frame.type());
+        cv::remap(frame, undistorted, map1, map2, cv::INTER_LINEAR); // OpenCV (可自动用OpenCL)
         int64_t t2 = getCurrentTimeUs();
-        // 裁剪ROI
         cv::Mat undistorted_roi = undistorted(last_valid_roi);
-        // resize到YOLO输入
-        cv::Mat yolo_input;
+        cv::Mat yolo_input_rga, yolo_input_cv;
         int yolo_width = zero_copy_ctx.model_width;
         int yolo_height = zero_copy_ctx.model_height;
-        cv::resize(undistorted_roi, yolo_input, cv::Size(yolo_width, yolo_height));
-        int64_t t3 = getCurrentTimeUs();
-        // 优化的预处理 - 直接写入NPU内存
+        // --- RGA resize，自动宽度对齐 ---
+        int aligned_width = ((undistorted_roi.cols + 15) / 16) * 16;
+        cv::Mat aligned_roi;
+        if (undistorted_roi.cols != aligned_width) {
+            aligned_roi = cv::Mat(undistorted_roi.rows, aligned_width, undistorted_roi.type(), cv::Scalar(0,0,0));
+            undistorted_roi.copyTo(aligned_roi(cv::Rect(0, 0, undistorted_roi.cols, undistorted_roi.rows)));
+        } else {
+            aligned_roi = undistorted_roi;
+        }
+        int64_t t3_rga_start = getCurrentTimeUs();
+        int rga_ret = rga_resize(aligned_roi, yolo_input_rga, yolo_width, yolo_height);
+        int64_t t3_rga = getCurrentTimeUs();
+        if (rga_ret != 0) {
+            printf("[profile] RGA resize failed\n");
+        }
+        // --- OpenCV resize ---
+        int64_t t3_cv_start = getCurrentTimeUs();
+        cv::resize(undistorted_roi, yolo_input_cv, cv::Size(yolo_width, yolo_height));
+        int64_t t3_cv = getCurrentTimeUs();
+        // --- 优化的预处理 - 直接写入NPU内存 ---
         letterbox_ext_t letter_box_ext;
-        ret = optimized_letterbox_to_npu(yolo_input, &zero_copy_ctx, &letter_box_ext);
+        ret = optimized_letterbox_to_npu(yolo_input_cv, &zero_copy_ctx, &letter_box_ext);
         if (ret != 0) {
             printf("预处理失败\n");
             continue;
         }
         // 零拷贝推理
         object_detect_result_list od_results;
+        std::vector<Object> objects;
         int64_t t4 = getCurrentTimeUs();
-        ret = zero_copy_inference(&rknn_app_ctx, &zero_copy_ctx, &letter_box_ext, &od_results);
+        float scale_x = (float)undistorted_roi.cols / (float)yolo_width;
+        float scale_y = (float)undistorted_roi.rows / (float)yolo_height;
+        ret = zero_copy_inference(&rknn_app_ctx, &zero_copy_ctx, &letter_box_ext, &od_results, objects, scale_x, scale_y);
         int64_t t5 = getCurrentTimeUs();
         if (ret != 0) {
             printf("推理失败\n");
@@ -566,8 +706,6 @@ int main(int argc, char **argv)
         }
         // 绘制结果
         cv::Mat result_frame = undistorted_roi.clone();
-        float scale_x = (float)undistorted_roi.cols / (float)yolo_width;
-        float scale_y = (float)undistorted_roi.rows / (float)yolo_height;
         for (int i = 0; i < od_results.count; i++) {
             object_detect_result *det_result = &(od_results.results[i]);
             float keypoints[17][2];
@@ -588,21 +726,46 @@ int main(int argc, char **argv)
                     cv::Point((int)(keypoints[j][0]), (int)(keypoints[j][1])),
                     3, cv::Scalar(255, 255, 0), -1);
             }
-            cv::Point2f foot_center = calculate_foot_position(keypoints);
-            cv::Point2f ground_point = map_to_ground(foot_center);
+            cv::Point2f foot_center = calculate_foot_position(keypoints, result_frame);
+            cv::Point2f ground_point = map_to_ground(foot_center, result_frame);
+            // 在包围框下方显示地面坐标
             if (ground_point.x >= 0 && ground_point.y >= 0) {
                 char dist_text[256];
-                sprintf(dist_text, "距离: (%.1f, %.1f)mm", ground_point.x, ground_point.y);
+                sprintf(dist_text, "GND:(%.1f,%.1f)mm", ground_point.x, ground_point.y);
                 cv::putText(result_frame, dist_text, 
-                           cv::Point((int)foot_center.x, (int)foot_center.y + 30), 
+                           cv::Point((int)foot_center.x, (int)foot_center.y + 50), 
                            cv::FONT_HERSHEY_SIMPLEX, 
-                           0.5, cv::Scalar(255, 0, 0), 2);
+                           0.5, cv::Scalar(0, 0, 255), 2);
             }
+            // debug输出每个pose的画面坐标和homography坐标
+            printf("[pose] idx=%d, foot_center=(%.1f,%.1f), ground=(%.1f,%.1f)\n", i, foot_center.x, foot_center.y, ground_point.x, ground_point.y);
         }
+        // 跟踪
+        t_track0 = getCurrentTimeUs();
+        std::vector<STrack> tracks = g_byte_track.update(objects);
+        t_track1 = getCurrentTimeUs();
+        // 绘制跟踪ID
+        for (const auto& track : tracks) {
+            cv::Rect_<float> rect(
+                track.tlbr[0],
+                track.tlbr[1],
+                track.tlbr[2] - track.tlbr[0],
+                track.tlbr[3] - track.tlbr[1]
+            );
+            int track_id = track.track_id;
+            cv::rectangle(result_frame, rect, cv::Scalar(0,255,0), 2);
+            char id_text[32];
+            sprintf(id_text, "ID:%d", track_id);
+            cv::putText(result_frame, id_text, cv::Point(rect.x, rect.y-5), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,0), 2);
+        }
+        
+        // 绘制地面网格
+        draw_ground_grid(result_frame, g_camera_mapping.homography);
+        
         int64_t t6 = getCurrentTimeUs();
-        // 显示性能profile
-        printf("[profile] cap:%.2fms undistort:%.2fms resize:%.2fms npu:%.2fms draw:%.2fms\n",
-            (t1-t0)/1000.0, (t2-t1)/1000.0, (t3-t2)/1000.0, (t5-t4)/1000.0, (t6-t5)/1000.0);
+        // 显示性能profile，增加bytetrack时间
+        printf("[profile] cap:%.2fms undistort:%.2fms rga_resize:%.2fms cv_resize:%.2fms npu:%.2fms bytetrack:%.2fms draw:%.2fms\n",
+            (t1-t0)/1000.0, (t2-t1)/1000.0, (t3_rga-t3_rga_start)/1000.0, (t3_cv-t3_cv_start)/1000.0, (t5-t4)/1000.0, (t_track1-t_track0)/1000.0, (t6-t5)/1000.0);
         char perf_text[256];
         sprintf(perf_text, "FPS: %.1f", frame_count * 1000000.0f / total_time);
         cv::putText(result_frame, perf_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
